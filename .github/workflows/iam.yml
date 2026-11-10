@@ -1,0 +1,98 @@
+name: IAM build and deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: npm install --no-save playwright@1.61.1 && npx playwright install --with-deps chromium
+      - run: python3 scripts/prepare.py
+      - run: docker compose config --quiet && docker compose up -d --build
+      - run: node scripts/smoke.cjs
+      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: docker save -o iam-tested.tar iam-course/keycloak:local
+      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iam-tested-image
+          path: iam-tested.tar
+          retention-days: 1
+          compression-level: 0
+      - if: always()
+        run: docker compose down --volumes
+
+  publish:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: iam-tested-image
+      - id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}/keycloak"
+          tag="$repo:$GITHUB_SHA"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker load -i iam-tested.tar
+          docker tag iam-course/keycloak:local "$tag"
+          docker push "$tag"
+          digest="$(docker image inspect "$tag" --format '{{index .RepoDigests 0}}')"
+          printf 'image=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: course-swarm
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: npm install --no-save playwright@1.61.1 && npx playwright install --with-deps chromium
+      - name: Deploy and validate two-node Swarm
+        env:
+          IAM_IMAGE: ${{ needs.publish.outputs.image }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          python3 scripts/local_lab.py
+          mkdir -p evidence
+          docker exec iam-course-manager docker node ls | tee evidence/swarm-nodes.txt
+          docker exec iam-course-manager docker stack ps --filter desired-state=running iam | tee evidence/swarm-tasks.txt
+          node scripts/smoke.cjs --capture | tee evidence/swarm-smoke.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarm-evidence
+          path: evidence/
+          if-no-files-found: ignore
