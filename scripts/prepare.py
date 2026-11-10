@@ -13,17 +13,22 @@ def write_secret(name, value):
     path = PRIVATE / name
     if not path.exists():
         path.write_bytes(value)
-        path.chmod(0o600)
+    # Compose bind-mounts these files for container users with different UIDs.
+    # The private parent directory limits host access.
+    path.chmod(0o644)
     return path
 
 def main():
     PRIVATE.mkdir(mode=0o700, exist_ok=True)
+    if os.name == "posix":
+        PRIVATE.chmod(0o700)
     for name in ("db_password", "admin_password", "oidc_secret"):
         write_secret(name, secrets.token_urlsafe(32).encode())
     write_secret("cookie_secret", secrets.token_bytes(32))
     realm = json.loads((ROOT / "config/realm.json").read_text(encoding="utf-8"))
     realm["clients"][0]["secret"] = (PRIVATE / "oidc_secret").read_text()
     (PRIVATE / "iam-realm.json").write_text(json.dumps(realm), encoding="utf-8")
+    (PRIVATE / "iam-realm.json").chmod(0o644)
     if all((PRIVATE / f).is_file() for f in ("ca_cert", "tls_cert", "tls_key")):
         return
     openssl = os.environ.get("IAM_OPENSSL") or shutil.which("openssl")

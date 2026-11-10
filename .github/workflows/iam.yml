@@ -29,6 +29,8 @@ jobs:
           path: iam-tested.tar
           retention-days: 1
           compression-level: 0
+      - if: failure()
+        run: docker compose ps -a && docker compose logs --tail=35
       - if: always()
         run: docker compose down --volumes
 
